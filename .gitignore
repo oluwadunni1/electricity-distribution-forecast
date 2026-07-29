@@ -1,0 +1,38 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# environment variables
+.env
+.vscode/
+
+# ── Data files ────────────────────────────────────────────────────────────────
+# Ignore the raw CSVs, but DO NOT ignore the whole data/ folder, 
+# otherwise Git will ignore the .dvc pointer files too!
+data/raw/*.csv
+
+# ── DVC ───────────────────────────────────────────────────────────────────────
+# Ignore DVC's local cache and config containing secrets
+.dvc/cache/
+.dvc/tmp/
+.dvc/config.local
+
+# ── API Caches ────────────────────────────────────────────────────────────────
+# Open-Meteo requests cache
+.cache/
+
+# ── Great Expectations ────────────────────────────────────────────────────────
+gx/uncommitted/
+
+# ── Azure ML / MLflow ─────────────────────────────────────────────────────────
+mlruns/
+azureml-logs/
+outputs/
+logs/

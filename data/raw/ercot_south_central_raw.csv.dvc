@@ -1,0 +1,5 @@
+outs:
+- md5: 22119b0a33a8da1523035c9c8d789261
+  size: 7332215
+  hash: md5
+  path: ercot_south_central_raw.csv

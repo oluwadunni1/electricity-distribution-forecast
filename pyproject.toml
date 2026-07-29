@@ -1,0 +1,16 @@
+[project]
+name = "electricity-distribution-forecast"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "dvc>=3.67.1",
+    "pandas",
+    "python-dotenv",
+    "gridstatusio",
+    "requests",
+    "requests-cache",
+    "great-expectations",
+    "dvc-s3>=3.3.0",
+]
