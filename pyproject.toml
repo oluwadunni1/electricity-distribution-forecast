@@ -15,4 +15,6 @@ dependencies = [
     "dvc-s3>=3.3.0",
     "ipykernel>=7.3.0",
     "mlflow>=3.14.0",
+    "shap>=0.52.0",
+    "numpy<2.5",
 ]
