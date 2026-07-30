@@ -13,4 +13,6 @@ dependencies = [
     "requests-cache",
     "great-expectations",
     "dvc-s3>=3.3.0",
+    "ipykernel>=7.3.0",
+    "mlflow>=3.14.0",
 ]

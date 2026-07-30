@@ -12,13 +12,20 @@ Sits immediately before the feature-engineering pipeline and enforces:
   5. Value ranges  – realistic physical bounds per numeric column.
   6. Timestamp fmt – strict ISO-8601 UTC format (%Y-%m-%d %H:%M:%S+00:00).
 
-Returns a boolean that the Azure pipeline uses to proceed or halt.
+Public API
+----------
+validate_dataframe(df) → bool
+    Accept a pandas DataFrame already in memory (e.g. from a notebook).
+    Renames columns to canonical names, runs the full GX suite, logs results.
+    Use this in experiments.ipynb.
 
-Any unexpected exception at any stage is caught, logged, and returned as
-False so the pipeline always fails gracefully — it never propagates a raw
-Python traceback to the Azure run.
+run_validation_gate(data_path) → bool
+    Load a CSV from disk and delegate to validate_dataframe.
+    Used by the CLI / Azure pipeline step.
 
-Usage:
+Both functions return True (pass) or False (fail) and never raise.
+
+CLI usage:
     python scripts/validate_raw_data.py --data_path data/raw/ercot_south_central_raw.csv
 
 Exit codes:
@@ -273,16 +280,111 @@ def _log_failures(result: gx.checkpoint.CheckpointResult) -> None:
                 log.error(msg)
 
 
-# ── Gate function (public API consumed by the Azure pipeline step) ─────────────
+# ── Core GX runner (shared by both public entry points) ──────────────────────
+
+def validate_dataframe(df: pd.DataFrame) -> bool:
+    """
+    Run the full GX validation suite against a pandas DataFrame
+    **already in memory**.
+
+    This is the primary entry point for notebooks and interactive scripts
+    where data has already been loaded.  ``run_validation_gate`` (CLI / Azure)
+    delegates to this function after loading the CSV from disk.
+
+    The timestamp column must still be a raw string (``dtype=object / str``)
+    for the regex expectation to evaluate the literal characters.  If you
+    loaded the CSV with ``parse_dates=True``, cast it back first:
+
+        df["timestamp"] = df["timestamp"].astype(str)
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The raw joined DataFrame.  Column names are normalised internally
+        to the canonical set before validation begins.
+
+    Returns
+    -------
+    bool
+        True  – every expectation passed.
+        False – any check failed or an unexpected error occurred.
+    """
+    log.info("=" * 64)
+    log.info("GX Validation Gate  |  in-memory DataFrame  (%d rows × %d cols)", *df.shape)
+    log.info("=" * 64)
+
+    try:
+        log.info("Source column names: %s", list(df.columns))
+
+        # ── Rename columns to canonical names (graceful on mismatch) ──────────
+        df = _safe_rename_columns(df)
+
+        # ── Ephemeral in-memory GX context ────────────────────────────────────
+        context: gx.DataContext = gx.get_context(mode="ephemeral")
+
+        # ── Wire pandas in-memory datasource ──────────────────────────────────
+        datasource = context.data_sources.add_pandas(name=DATASOURCE_NAME)
+        data_asset = datasource.add_dataframe_asset(name=DATA_ASSET_NAME)
+        batch_def = data_asset.add_batch_definition_whole_dataframe(
+            BATCH_DEFINITION_NAME
+        )
+
+        # ── Build and register expectation suite ──────────────────────────────
+        suite = build_expectation_suite(context)
+
+        # ── Validation definition: one batch ↔ one suite ──────────────────────
+        val_def = gx.ValidationDefinition(
+            name=VALIDATION_DEFINITION_NAME,
+            data=batch_def,
+            suite=suite,
+        )
+        context.validation_definitions.add(val_def)
+
+        # ── Checkpoint: silent local gate, zero notification actions ──────────
+        checkpoint = gx.Checkpoint(
+            name=CHECKPOINT_NAME,
+            validation_definitions=[val_def],
+            actions=[],
+        )
+        context.checkpoints.add(checkpoint)
+
+        # ── Execute ───────────────────────────────────────────────────────────
+        log.info("Running checkpoint …")
+        result: gx.checkpoint.CheckpointResult = checkpoint.run(
+            batch_parameters={"dataframe": df},
+        )
+
+        # ── Evaluate ──────────────────────────────────────────────────────────
+        passed: bool = result.success
+        total = _count_expectations(result)
+
+        log.info("=" * 64)
+        if passed:
+            log.info("  VALIDATION PASSED — all %d expectations met.", total)
+        else:
+            log.error(
+                "  VALIDATION FAILED — %d expectation(s) not met:", total
+            )
+            _log_failures(result)
+        log.info("=" * 64)
+        return passed
+
+    except Exception:
+        log.error("=" * 64)
+        log.error("  UNEXPECTED ERROR in validation gate.")
+        log.error("Full traceback:\n%s", traceback.format_exc())
+        log.error("=" * 64)
+        return False
+
+
+# ── Gate function (public API consumed by the Azure pipeline / CLI) ───────────
 
 def run_validation_gate(data_path: Path) -> bool:
     """
-    Execute the full validation suite against *data_path*.
+    Load a CSV from *data_path* and delegate to :func:`validate_dataframe`.
 
-    Every failure mode — missing file, unreadable CSV, column shape mismatch,
-    failed expectations, or any unexpected exception — is caught, logged
-    at ERROR level, and returned as ``False`` so the pipeline always receives
-    a clean boolean rather than an unhandled traceback.
+    Every failure mode (missing file, unreadable CSV, failed expectations, or
+    any unexpected exception) is caught and returned as ``False``.
 
     Parameters
     ----------
@@ -300,91 +402,21 @@ def run_validation_gate(data_path: Path) -> bool:
     log.info("=" * 64)
 
     try:
-        # ── Guard: file must exist ────────────────────────────────────────────
         if not data_path.exists():
             log.error("Data file not found: %s", data_path.resolve())
             return False
 
-        # ── Load CSV ──────────────────────────────────────────────────────────
-        # Column 0 (timestamp) is kept as str so the regex expectation can
-        # evaluate the raw character sequence — parsing to datetime64 first
-        # would destroy the original string formatting.
+        # Keep column 0 (timestamp) as a raw string so the regex expectation
+        # evaluates the literal character sequence, not a parsed datetime.
         log.info("Loading CSV …")
         df = pd.read_csv(data_path, header=0, dtype={0: str})
         log.info("Loaded %d rows × %d columns.", *df.shape)
-        log.info("Source column names: %s", list(df.columns))
 
-        # ── Rename columns to canonical names (graceful on mismatch) ──────────
-        df = _safe_rename_columns(df)
-
-        # ── Initialise ephemeral in-memory GX context ─────────────────────────
-        # mode="ephemeral" → no files written to disk; CI/CD-safe.
-        context: gx.DataContext = gx.get_context(mode="ephemeral")
-
-        # ── Wire pandas in-memory datasource ─────────────────────────────────
-        datasource = context.data_sources.add_pandas(name=DATASOURCE_NAME)
-        data_asset = datasource.add_dataframe_asset(name=DATA_ASSET_NAME)
-        batch_def = data_asset.add_batch_definition_whole_dataframe(
-            BATCH_DEFINITION_NAME
-        )
-
-        # ── Build and register expectation suite ─────────────────────────────
-        suite = build_expectation_suite(context)
-
-        # ── Validation definition: one batch ↔ one suite ─────────────────────
-        val_def = gx.ValidationDefinition(
-            name=VALIDATION_DEFINITION_NAME,
-            data=batch_def,
-            suite=suite,
-        )
-        context.validation_definitions.add(val_def)
-        log.info("ValidationDefinition '%s' wired.", VALIDATION_DEFINITION_NAME)
-
-        # ── Checkpoint: silent local gate, zero notification actions ─────────
-        # actions=[] ensures no Slack, email, DataDocs, or other side-effects.
-        checkpoint = gx.Checkpoint(
-            name=CHECKPOINT_NAME,
-            validation_definitions=[val_def],
-            actions=[],
-        )
-        context.checkpoints.add(checkpoint)
-        log.info(
-            "Checkpoint '%s' configured (silent, no notification actions).",
-            CHECKPOINT_NAME,
-        )
-
-        # ── Execute ───────────────────────────────────────────────────────────
-        log.info("Running checkpoint …")
-        result: gx.checkpoint.CheckpointResult = checkpoint.run(
-            batch_parameters={"dataframe": df},
-        )
-
-        # ── Evaluate ──────────────────────────────────────────────────────────
-        passed: bool = result.success
-        total = _count_expectations(result)
-
-        log.info("=" * 64)
-        if passed:
-            log.info("  VALIDATION PASSED — all %d expectations met.", total)
-            log.info("Pipeline may proceed to feature engineering.")
-        else:
-            log.error(
-                "  VALIDATION FAILED — pipeline is HALTED.  "
-                "Failed expectation(s) below:"
-            )
-            _log_failures(result)
-
-        log.info("=" * 64)
-        return passed
+        return validate_dataframe(df)
 
     except Exception:
-        # Catch-all: any unhandled exception (e.g. GX API changes, OOM, disk
-        # errors) is logged with a full traceback then returned as False so
-        # the Azure pipeline step exits 1 cleanly instead of crashing.
         log.error("=" * 64)
-        log.error(
-            "  UNEXPECTED ERROR in validation gate — pipeline is HALTED."
-        )
+        log.error("  UNEXPECTED ERROR loading data — pipeline is HALTED.")
         log.error("Full traceback:\n%s", traceback.format_exc())
         log.error("=" * 64)
         return False

@@ -14,8 +14,7 @@ wheels/
 .vscode/
 
 # ── Data files ────────────────────────────────────────────────────────────────
-# Ignore the raw CSVs, but DO NOT ignore the whole data/ folder, 
-# otherwise Git will ignore the .dvc pointer files too!
+
 data/raw/*.csv
 
 # ── DVC ───────────────────────────────────────────────────────────────────────
@@ -30,9 +29,3 @@ data/raw/*.csv
 
 # ── Great Expectations ────────────────────────────────────────────────────────
 gx/uncommitted/
-
-# ── Azure ML / MLflow ─────────────────────────────────────────────────────────
-mlruns/
-azureml-logs/
-outputs/
-logs/
