@@ -1,15 +1,15 @@
 """
 fetch_weather.py
 ----------------
-Fetches raw hourly weather data for four representative South Central Texas
-cities (Austin, San Antonio, Round Rock, San Marcos) from the Open-Meteo
-archive API, combines them into a single South-Central-zone weather series
-using a population-weighted average, and saves the result to
-data/raw/weather_raw.csv for inspection.
+Fetches raw hourly weather (temperature, humidity, precipitation) for four
+representative South Central Texas cities from the Open-Meteo archive API
+and saves them side-by-side, UTC-indexed, with NO weighting or aggregation
+applied. Combining/weighting/daily-extremes logic lives in
+src/weather_transform.py so it can be reused identically at inference time.
 
-This directly mirrors the multi-city, population-weighted aggregation
-approach used in the ERCOT SCENT SHAP paper this project is based on —
-see the note at the bottom of this file for details and sourcing.
+Output columns:
+    timestamp, timestamp_central,
+    temp_c_<city>, humidity_pct_<city>, precip_mm_<city>  (x4 cities)
 
 Usage:
     uv run python scripts/fetch_weather.py --start_date 2016-01-01 --end_date 2016-03-01
@@ -34,18 +34,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Representative cities for the South Central weather zone ─────────────────
-# Coordinates + 2024 Census/ACS population estimates, used to compute weights.
-CITIES = {
-    "san_antonio": {"lat": 29.4241, "lon": -98.4936, "population": 1_479_835},
-    "austin":      {"lat": 30.2672, "lon": -97.7431, "population":   979_539},
-    "round_rock":  {"lat": 30.5083, "lon": -97.6789, "population":   135_665},
-    "san_marcos":  {"lat": 29.8833, "lon": -97.9414, "population":    74_319},
+CITY_COORDS = {
+    "san_antonio": {"lat": 29.4241, "lon": -98.4936},
+    "austin":      {"lat": 30.2672, "lon": -97.7431},
+    "round_rock":  {"lat": 30.5083, "lon": -97.6789},
+    "san_marcos":  {"lat": 29.8833, "lon": -97.9414},
 }
-
-TOTAL_POPULATION = sum(c["population"] for c in CITIES.values())
-for _name, _info in CITIES.items():
-    _info["weight"] = _info["population"] / TOTAL_POPULATION
 
 OPENMETEO_URL = "https://archive-api.open-meteo.com/v1/archive"
 OUTPUT_PATH   = Path("data/raw/weather_raw.csv")
@@ -53,16 +47,18 @@ OUTPUT_PATH   = Path("data/raw/weather_raw.csv")
 
 def parse_args() -> argparse.Namespace:
     today = date.today().isoformat()
-    p = argparse.ArgumentParser(
-        description="Fetch and population-weight-average weather from Open-Meteo for South Central TX."
-    )
+    p = argparse.ArgumentParser(description="Fetch raw per-city hourly weather from Open-Meteo.")
     p.add_argument("--start_date", default="2016-01-01")
     p.add_argument("--end_date", default=today)
     return p.parse_args()
 
 
-def fetch_city(cache_session: requests_cache.CachedSession, name: str, lat: float, lon: float,
-               start: date, end: date) -> pd.DataFrame:
+def fetch_city_hourly(
+    cache_session: requests_cache.CachedSession,
+    name: str, lat: float, lon: float,
+    start: date, end: date,
+) -> pd.DataFrame:
+    """Fetch hourly temp, humidity, precip for a single city (UTC, instantaneous values)."""
     params = {
         "latitude":   lat,
         "longitude":  lon,
@@ -72,16 +68,20 @@ def fetch_city(cache_session: requests_cache.CachedSession, name: str, lat: floa
         "timezone":   "UTC",
     }
 
-    log.info("Fetching %s (lat=%.4f, lon=%.4f) ...", name, lat, lon)
-    try:
-        resp = cache_session.get(OPENMETEO_URL, params=params, timeout=60)
-        resp.raise_for_status()
-    except requests.exceptions.Timeout:
-        log.error("Request timed out for %s.", name)
-        sys.exit(1)
-    except requests.exceptions.HTTPError as exc:
-        log.error("HTTP %s for %s: %s", exc.response.status_code, name, exc.response.text[:300])
-        sys.exit(1)
+    log.info("Fetching hourly %s (lat=%.4f, lon=%.4f) ...", name, lat, lon)
+    for attempt in range(3):
+        try:
+            resp = cache_session.get(OPENMETEO_URL, params=params, timeout=60)
+            resp.raise_for_status()
+            break
+        except requests.exceptions.Timeout:
+            if attempt == 2:
+                log.error("Request timed out for %s (hourly) after 3 attempts.", name)
+                sys.exit(1)
+            log.warning("Timeout for %s (hourly), retrying (%d/3)...", name, attempt + 2)
+        except requests.exceptions.HTTPError as exc:
+            log.error("HTTP %s for %s (hourly): %s", exc.response.status_code, name, exc.response.text[:300])
+            sys.exit(1)
 
     payload = resp.json()
     if "hourly" not in payload:
@@ -89,13 +89,13 @@ def fetch_city(cache_session: requests_cache.CachedSession, name: str, lat: floa
 
     hourly = payload["hourly"]
     df = pd.DataFrame({
-        "timestamp":               pd.to_datetime(hourly["time"], utc=True),
-        f"temp_c_{name}":          hourly["temperature_2m"],
-        f"humidity_pct_{name}":    hourly["relative_humidity_2m"],
-        f"precip_mm_{name}":       hourly["precipitation"],
+        "timestamp":            pd.to_datetime(hourly["time"], utc=True),
+        f"temp_c_{name}":       hourly["temperature_2m"],
+        f"humidity_pct_{name}": hourly["relative_humidity_2m"],
+        f"precip_mm_{name}":    hourly["precipitation"],
     })
     df = df.sort_values("timestamp").reset_index(drop=True)
-    log.info("  → %d rows for %s", len(df), name)
+    log.info("  → %d hourly rows for %s", len(df), name)
     return df
 
 
@@ -104,105 +104,69 @@ def main() -> None:
     start = date.fromisoformat(args.start_date)
     end   = date.fromisoformat(args.end_date)
 
-    log.info("=" * 62)
-    log.info("Open-Meteo fetch (South Central proxy): %s → %s", start, end)
-    log.info("Cities and population weights:")
-    for name, info in CITIES.items():
-        log.info("  %-12s pop=%9d  weight=%.4f", name, info["population"], info["weight"])
-    log.info("=" * 62)
+    log.info("=" * 72)
+    log.info("Open-Meteo raw fetch (per-city, unweighted): %s → %s", start, end)
+    log.info("Cities: %s", ", ".join(CITY_COORDS.keys()))
+    log.info("=" * 72)
 
-    cache_session = requests_cache.CachedSession(
-        ".cache/openmeteo_cache", expire_after=86_400
-    )
+    cache_session = requests_cache.CachedSession(".cache/openmeteo_cache", expire_after=86_400)
 
-    # ── Fetch each city separately ────────────────────────────────────────────
-    city_frames = {
-        name: fetch_city(cache_session, name, coords["lat"], coords["lon"], start, end)
-        for name, coords in CITIES.items()
-    }
+    names = list(CITY_COORDS.keys())
+    hourly_frames: dict[str, pd.DataFrame] = {}
+    for name, coords in CITY_COORDS.items():
+        hourly_frames[name] = fetch_city_hourly(
+            cache_session, name, coords["lat"], coords["lon"], start, end,
+        )
 
-    # ── Merge all four on timestamp (inner join — should match exactly, all
-    #    queried for the same range/timezone) ─────────────────────────────────
-    names = list(CITIES.keys())
-    merged = city_frames[names[0]]
+    # ── Merge all cities side-by-side on timestamp ───────────────────────────
+    merged = hourly_frames[names[0]]
     for name in names[1:]:
-        merged = merged.merge(city_frames[name], on="timestamp", how="inner")
+        merged = merged.merge(hourly_frames[name], on="timestamp", how="inner")
 
-    row_counts = {name: len(df) for name, df in city_frames.items()}
+    row_counts = {name: len(df) for name, df in hourly_frames.items()}
     if len(set(row_counts.values())) > 1 or len(merged) != row_counts[names[0]]:
         log.warning(
-            "City row counts didn't all match (%s) — merged=%d. Check for gaps in one city's response.",
+            "Per-city row counts didn't all match (%s) — merged=%d. Check for gaps in one city's response.",
             row_counts, len(merged),
         )
 
-    # ── Population-weighted average across the four cities ───────────────────
-    for field in ("temp_c", "humidity_pct", "precip_mm"):
-        merged[field] = sum(
-            merged[f"{field}_{name}"] * CITIES[name]["weight"] for name in names
-        )
+    merged = merged.sort_values("timestamp").reset_index(drop=True)
 
-    out = merged[["timestamp", "temp_c", "humidity_pct", "precip_mm"]].copy()
-    out = out.sort_values("timestamp").reset_index(drop=True)
+    # ── Manual-validation column: same instant, Central-Time label ──────────
+    merged["timestamp_central"] = merged["timestamp"].dt.tz_convert("America/Chicago")
 
-    log.info("Weighted-average row count : %d", len(out))
-    log.info("First ts UTC               : %s", out["timestamp"].iloc[0])
-    log.info("Last  ts UTC               : %s", out["timestamp"].iloc[-1])
+    # Reorder for readability
+    cols = ["timestamp", "timestamp_central"] + [c for c in merged.columns if c not in ("timestamp", "timestamp_central")]
+    merged = merged[cols]
 
-    # ── Diagnostic prints ─────────────────────────────────────────────────────
-    print("\n=== First 5 rows (population-weighted average) ===")
-    print(out.head(5).to_string(index=False))
-    print("\n=== Last 5 rows (population-weighted average) ===")
-    print(out.tail(5).to_string(index=False))
+    # ── Gap / duplicate checks ────────────────────────────────────────────────
+    diffs = merged["timestamp"].diff().dropna()
+    gaps  = diffs[diffs != pd.Timedelta("1h")]
+    dupes = merged["timestamp"].duplicated().sum()
 
-    # Gap / duplicate checks
-    diffs = out["timestamp"].diff().dropna()
-    gaps = diffs[diffs != pd.Timedelta("1h")]
-    dupes = out["timestamp"].duplicated().sum()
+    print("\n=== First 5 rows ===")
+    print(merged.head(5).to_string(index=False))
+    print("\n=== Last 5 rows ===")
+    print(merged.tail(5).to_string(index=False))
 
     if dupes:
         print(f"\n⚠  {dupes} duplicate timestamp(s) found.")
     if len(gaps):
-        print(f"\n⚠  {len(gaps)} gap(s) ≠ 1 hour found (excluding duplicates):")
+        print(f"\n⚠  {len(gaps)} gap(s) ≠ 1 hour found:")
         for i in gaps.index[:10]:
-            print(f"   {out['timestamp'].iloc[i-1]}  →  {out['timestamp'].iloc[i]}  (Δ = {diffs.iloc[i]})")
+            print(f"   {merged['timestamp'].iloc[i-1]}  →  {merged['timestamp'].iloc[i]}  (Δ = {diffs.iloc[i]})")
     if not dupes and not len(gaps):
-        print("\n✓  All rows are exactly 1 hour apart, no duplicates.")
+        print("\n✓  All rows exactly 1 hour apart, no duplicates.")
 
-    print("\n⚡ NOTE: timezone='UTC' was sent to the API for all four cities — all timestamps are UTC.")
-    print("   Values are a population-weighted average across Austin, San Antonio, Round Rock,")
-    print("   and San Marcos, used as a proxy for the ERCOT South Central weather zone.\n")
+    print("\n⚡ NOTE: 'timestamp' is UTC (canonical, used for all joins/lags).")
+    print("   'timestamp_central' is a derived label for manual cross-checking against")
+    print("   grid.io or NOAA's Central-Time displays — do not use it for merges.\n")
 
-    # ── Save ──────────────────────────────────────────────────────────────────
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    out.to_csv(OUTPUT_PATH, index=False)
-
-    print(f"Saved {len(out):,} rows → {OUTPUT_PATH.resolve()}")
-    print(f"Columns: {list(out.columns)}\n")
+    merged.to_csv(OUTPUT_PATH, index=False)
+    print(f"Saved {len(merged):,} rows → {OUTPUT_PATH.resolve()}")
+    print(f"Columns: {list(merged.columns)}\n")
 
 
 if __name__ == "__main__":
     main()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# METHODOLOGY NOTE — relationship to the source research paper
-# ─────────────────────────────────────────────────────────────────────────────
-# The ERCOT SCENT SHAP paper this project draws on notes that "since a unified
-# weather dataset does not exist for the SCENT region as a whole," the authors
-# extracted weather from four representative cities — Austin, San Antonio,
-# Round Rock, and San Marcos — and combined them using a population-weighted
-# average, so more populous cities have proportionally more influence on the
-# region-level weather signal used for load forecasting.
-#
-# This script mirrors that approach directly: each city's population share
-# (2024 Census/ACS estimates) determines its weight in the final average.
-# San Antonio (the largest of the four) carries the most weight (~55%),
-# followed by Austin (~37%), with Round Rock and San Marcos contributing
-# smaller shares (~5% and ~3% respectively) reflecting their smaller
-# populations relative to the two anchor cities.
-#
-# Population figures should be revisited periodically (e.g. against annual
-# Census Bureau QuickFacts updates) if this project is extended or re-run
-# well beyond the initial build, since city populations — especially
-# Round Rock and San Marcos, both fast-growing — will shift over time.
-# ─────────────────────────────────────────────────────────────────────────────

@@ -17,4 +17,7 @@ dependencies = [
     "mlflow>=3.14.0",
     "shap>=0.52.0",
     "numpy<2.5",
+    "xgboost>=2.0",
+    "matplotlib>=3.7",
+    "lightgbm>=4.7.0",
 ]
