@@ -1,0 +1,5 @@
+outs:
+- md5: 8d9e8e125dc71ee10500d637193083a9
+  size: 5733794
+  hash: md5
+  path: df_core_features.parquet
