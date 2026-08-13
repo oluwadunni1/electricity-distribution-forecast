@@ -29,3 +29,7 @@ data/raw/*.csv
 
 # ── Great Expectations ────────────────────────────────────────────────────────
 gx/uncommitted/
+
+# model artifacts
+/Notebooks/artifacts/
+/Notebooks/catboost_info/
