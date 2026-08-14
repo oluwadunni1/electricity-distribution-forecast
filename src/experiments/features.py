@@ -25,7 +25,18 @@ from pandas.tseries.holiday import USFederalHolidayCalendar
 # ---------------------------------------------------------------------------
 
 def add_base_features(df: pd.DataFrame) -> pd.DataFrame:
-    """trend_idx, hour_x_temp, rolling temp std, and lag-24 temp change."""
+    """
+    trend_idx, hour_x_temp, rolling temp std, and lag-24 temp change.
+
+    NOTE: temp_c_roll_std_72 (window=72, min_periods=24) and temp_change_vs_lag24
+    (shift(24)) both produce NaN for the first ~24-72 rows of whatever dataframe
+    is passed in — this is a NEW warm-up period, separate from the load_lag_24/168
+    warm-up already handled in Preprocessing.ipynb before the parquet was saved.
+    Preprocessing's dropna only covered the columns that existed at that stage;
+    it has no way to know about columns created later, here. Call
+    drop_base_feature_warmup() right after this to clean it up, the same way
+    Preprocessing.ipynb explicitly drops its own warm-up rows.
+    """
     out = df.copy()
     out["trend_idx"] = (
         out["timestamp"] - out["timestamp"].min()
@@ -33,6 +44,21 @@ def add_base_features(df: pd.DataFrame) -> pd.DataFrame:
     out["hour_x_temp"] = out["hour"] * out["temp_c"]
     out["temp_c_roll_std_72"] = out["temp_c"].rolling(window=72, min_periods=24).std()
     out["temp_change_vs_lag24"] = out["temp_c"] - out["temp_c"].shift(24)
+    return out
+
+
+def drop_base_feature_warmup(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+    """
+    Drops rows with NaN in the columns add_base_features() just created.
+    Call this immediately after add_base_features(), before the train/test
+    split — mirrors Preprocessing.ipynb's own explicit warm-up drop, just for
+    the features that get engineered downstream instead of at ingestion time.
+    """
+    warmup_cols = ["temp_c_roll_std_72", "temp_change_vs_lag24"]
+    before = len(df)
+    out = df.dropna(subset=warmup_cols).reset_index(drop=True)
+    if verbose:
+        print(f"Dropped {before - len(out)} warm-up row(s) for {warmup_cols}")
     return out
 
 
