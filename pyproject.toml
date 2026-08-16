@@ -21,6 +21,7 @@ api = [
     "xgboost>=2.0",
     "lightgbm>=4.7.0",
     "catboost==1.2.10",
+    "psycopg[binary,pool]>=3.2",
     "cloudpickle==3.1.2",
 ]
 

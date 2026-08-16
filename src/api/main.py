@@ -10,6 +10,7 @@ Run locally:
     uvicorn src.api.main:app --reload --port 8000
 """
 from contextlib import asynccontextmanager
+import asyncio
 
 import mlflow
 import pandas as pd
@@ -19,6 +20,7 @@ from pydantic import ValidationError
 
 from src.experiments import config
 from src.inference import feature_engineering as fe
+from src.api import db
 from src.api.schema import build_request_model, PredictionResponse, HealthResponse
 
 MODEL_NAME = "Electricity-Load-Forecaster"
@@ -60,8 +62,11 @@ async def lifespan(app: FastAPI):
     app.state.use_holiday_feature = artifacts["use_holiday_feature"]
     app.state.RequestModel = build_request_model(model_input_columns)
 
+    app.state.db_pool = db.create_pool()
+
     print(f"Loaded {MODEL_NAME}@{MODEL_ALIAS} v{version}  |  input columns: {model_input_columns}")
     yield
+    app.state.db_pool.close()
 
 
 app = FastAPI(title="Electricity Load Forecaster API", lifespan=lifespan)
@@ -97,7 +102,29 @@ async def predict(request: Request):
     except Exception as exc:  # noqa: BLE001 — surfaced to the caller deliberately
         raise HTTPException(status_code=500, detail=f"Inference failed: {exc}") from exc
 
+    try:
+        # Runs off the event loop deliberately — db.log_prediction is a
+        # blocking psycopg call. Without to_thread, a slow or hanging DB
+        # connection would stall every other request the server is handling,
+        # not just this one (this was the cause of the full-server freeze).
+        await asyncio.to_thread(
+            db.log_prediction,
+            app.state.db_pool,
+            target_timestamp=validated.target_timestamp,
+            features=row.iloc[0].to_dict(),
+            predicted_load_mw=float(prediction),
+            model_name=app.state.model_name,
+            model_version=app.state.model_version,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # A logging failure shouldn't turn a successful prediction into a 500 —
+        # the caller still gets their forecast. Surfacing this as a server-side
+        # log line (not silently swallowed) is deliberate: it needs to be
+        # noticeable in ops, just not block the response.
+        print(f"WARNING: failed to log prediction to DB: {exc}")
+
     return PredictionResponse(
+        target_timestamp=validated.target_timestamp,
         predicted_load_mw=float(prediction),
         model_name=app.state.model_name,
         model_version=app.state.model_version,

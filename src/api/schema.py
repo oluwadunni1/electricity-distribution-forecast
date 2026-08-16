@@ -50,8 +50,17 @@ FEATURE_FIELD_SPECS: dict = {
 def build_request_model(expected_features: list[str]) -> type[BaseModel]:
     """
     Builds a PredictionRequest model containing exactly the champion's expected
-    features — no more, no less. Pydantic's `extra="forbid"` config means a
-    payload with an unexpected field (e.g. holiday_freq sent to a model that
+    features — no more, no less — plus `target_timestamp`, which every request
+    must supply regardless of which features the current champion needs.
+
+    target_timestamp identifies WHICH HOUR is being forecasted (not when the
+    API call happens — that's predicted_at in the response). This is the join
+    key the DB logging and later ground-truth backfill job rely on, and it
+    can't be reliably reconstructed from the engineered features alone
+    (hour/dayofweek/month are decomposed, trend_idx doesn't cleanly invert),
+    so the caller — which already knows what hour it built features for —
+    supplies it explicitly. Pydantic's `extra="forbid"` means a payload with
+    any other unexpected field (e.g. holiday_freq sent to a model that
     doesn't use it) is rejected, not silently ignored.
     """
     unknown = set(expected_features) - set(FEATURE_FIELD_SPECS)
@@ -62,6 +71,10 @@ def build_request_model(expected_features: list[str]) -> type[BaseModel]:
         )
 
     fields = {name: FEATURE_FIELD_SPECS[name] for name in expected_features}
+    fields["target_timestamp"] = (
+        datetime,
+        Field(..., description="UTC timestamp of the hour being forecasted"),
+    )
     return create_model(
         "PredictionRequest",
         __config__={"extra": "forbid"},
@@ -70,6 +83,7 @@ def build_request_model(expected_features: list[str]) -> type[BaseModel]:
 
 
 class PredictionResponse(BaseModel):
+    target_timestamp: datetime
     predicted_load_mw: float
     model_name: str
     model_version: str
