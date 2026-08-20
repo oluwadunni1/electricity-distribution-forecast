@@ -15,6 +15,7 @@ USAGE
     python scripts/test_api.py --input data/interim/pipeline_test_output.parquet
 """
 import argparse
+from datetime import datetime, timedelta, timezone
 
 import mlflow
 import pandas as pd
@@ -35,9 +36,18 @@ def get_reference_predictions(df: pd.DataFrame) -> pd.Series:
 
 
 def get_api_predictions(df: pd.DataFrame) -> pd.Series:
+    # target_timestamp is required by the API but isn't part of this file's
+    # columns (it's pure engineered-feature output — the timestamp never
+    # survives engineer_features). It's metadata only, not a model input, so
+    # a synthetic sequential value here doesn't affect what's being tested:
+    # whether the API's prediction matches calling the model directly.
+    base_ts = datetime.now(timezone.utc)
+
     preds = []
-    for _, row in df.iterrows():
+    for i, (_, row) in enumerate(df.iterrows()):
         payload = row.to_dict()
+        payload["target_timestamp"] = (base_ts + timedelta(hours=i)).isoformat()
+
         resp = requests.post(API_URL, json=payload, timeout=10)
         if resp.status_code != 200:
             raise RuntimeError(f"API returned {resp.status_code}: {resp.text}")

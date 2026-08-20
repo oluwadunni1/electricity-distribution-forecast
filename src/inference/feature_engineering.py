@@ -28,12 +28,26 @@ FEATURES_V3 = FEATURES_V2 + ["temp_change_vs_lag24", "is_high_precip_event"]
 
 # Raw columns that must already exist BEFORE this module runs — i.e. produced
 # by upstream ingestion/ETL (including any lag/rolling features), not derived here.
+# trend_idx is NOT in this list — see compute_trend_idx() below, it's derived
+# here from target_timestamp + the bundle's trend_idx_origin, not supplied raw.
 RAW_REQUIRED_COLUMNS = [
-    "trend_idx", "temp_c", "humidity_pct", "precip_mm", "tmax", "tmin", "tavg",
+    "temp_c", "humidity_pct", "precip_mm", "tmax", "tmin", "tavg",
     "hour", "dayofweek", "month", "is_weekend", "is_holiday", "holiday_name",
     "load_lag_24", "load_lag_168", "hour_x_temp", "temp_c_roll_std_72",
     "temp_change_vs_lag24",
 ]
+
+
+def compute_trend_idx(timestamp: pd.Timestamp, trend_idx_origin: pd.Timestamp) -> float:
+    """
+    trend_idx = years elapsed since the ORIGINAL TRAINING SET's earliest
+    timestamp — a fixed anchor, not something recomputed relative to whatever
+    batch of data happens to be passed in. trend_idx_origin must come from the
+    champion bundle (see load_champion_artifacts), never recomputed locally —
+    recomputing it from a new batch's own min() would silently produce
+    trend_idx=0 for every row, which is wrong but raises no error.
+    """
+    return (timestamp - trend_idx_origin).total_seconds() / (3600 * 24 * 365)
 
 
 # ---------------------------------------------------------------------------
@@ -46,20 +60,30 @@ RAW_REQUIRED_COLUMNS = [
 def engineer_features(
     df: pd.DataFrame,
     thresholds: dict,
+    trend_idx_origin: pd.Timestamp,
     holiday_freq_map: dict | None = None,
     use_holiday_feature: bool = True,
+    timestamp_col: str = "timestamp",
 ) -> pd.DataFrame:
     """
     Apply the exact derivation logic used at training time.
-    `thresholds` / `holiday_freq_map` must come from an artifact fit on TRAIN —
-    never recomputed here. That's what keeps inference in sync with whichever
-    model version produced them.
+    `thresholds` / `holiday_freq_map` / `trend_idx_origin` must come from an
+    artifact fit on TRAIN — never recomputed here. That's what keeps inference
+    in sync with whichever model version produced them.
+
+    `df` must contain RAW_REQUIRED_COLUMNS plus a `timestamp_col` column
+    (the target hour being forecasted) — trend_idx is computed from that,
+    not supplied as a raw input.
     """
     missing = [c for c in RAW_REQUIRED_COLUMNS if c not in df.columns]
+    if timestamp_col not in df.columns:
+        missing.append(timestamp_col)
     if missing:
         raise ValueError(f"Missing required raw columns: {missing}")
 
     out = df.copy()
+
+    out["trend_idx"] = out[timestamp_col].apply(lambda ts: compute_trend_idx(ts, trend_idx_origin))
 
     out["is_extreme_heat_event"] = (out["tmax"] > thresholds["heat"]).astype(int)
     out["is_extreme_cold_event"] = (out["tmin"] < thresholds["cold"]).astype(int)
@@ -102,6 +126,7 @@ def load_champion_artifacts(
     return {
         "thresholds": bundle["thresholds"],
         "holiday_freq_map": bundle["holiday_freq_map"],
+        "trend_idx_origin": bundle["trend_idx_origin"],
         "use_holiday_feature": "holiday_freq" in bundle.get("features", []),
         "model_version_tag": bundle.get("feature_version", "unknown"),
         "expected_features": bundle["features"],
@@ -123,6 +148,7 @@ def transform_for_inference(raw_df: pd.DataFrame, artifacts: dict | None = None)
     return engineer_features(
         raw_df,
         thresholds=artifacts["thresholds"],
+        trend_idx_origin=artifacts["trend_idx_origin"],
         holiday_freq_map=artifacts.get("holiday_freq_map"),
         use_holiday_feature=artifacts.get("use_holiday_feature", True),
     )
@@ -130,8 +156,10 @@ def transform_for_inference(raw_df: pd.DataFrame, artifacts: dict | None = None)
 
 # ---------------------------------------------------------------------------
 # NOTE — training script requirement:
-# production_bundle must include these two keys before mlflow.pyfunc.log_model():
+# production_bundle must include these three keys before mlflow.pyfunc.log_model():
 #   production_bundle["thresholds"] = thresholds        # from features.fit_extreme_event_thresholds()
 #   production_bundle["holiday_freq_map"] = holiday_freq_map  # from features.fit_holiday_freq_map(), or None
-# Without this, load_champion_artifacts() has nothing to load.
+#   production_bundle["trend_idx_origin"] = df["timestamp"].min()  # the FULL df's min, pre-split — see add_base_features()
+# Without this, load_champion_artifacts() has nothing to load, and trend_idx
+# can't be reproduced correctly for new data.
 # ---------------------------------------------------------------------------

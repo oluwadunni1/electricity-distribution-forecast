@@ -1,3 +1,4 @@
 /df_core_features.parquet
 /pipeline_test_sample.parquet
 /pipeline_test_output.parquet
+/mock_pipeline_results.csv
