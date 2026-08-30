@@ -39,9 +39,17 @@ experiments = [
     "requests-cache",
 ]
 
+# Test-only tooling — not needed to run the API or the notebooks.
+dev = [
+    "pytest>=8.0",
+]
+
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

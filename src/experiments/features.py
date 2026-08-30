@@ -15,9 +15,15 @@ Two kinds of function here, and the split matters:
     FREQUENCY computed from data (extreme-event quantiles, holiday
     frequency). These must be fit on train (or the current CV fold's train
     slice) only, then applied to both splits — never refit on validation/test.
+
+hour_x_temp/temp_c_roll_std_72/temp_change_vs_lag24 and the holiday-name
+calendar lookup are computed via src/common/timestamps.py, not here — that
+module is the single shared implementation used by both training (this file)
+and live ETL (src/etl/pipeline.py). See its docstring for why.
 """
 import pandas as pd
-from pandas.tseries.holiday import USFederalHolidayCalendar
+
+from src.common import timestamps
 
 
 # ---------------------------------------------------------------------------
@@ -41,9 +47,7 @@ def add_base_features(df: pd.DataFrame) -> pd.DataFrame:
     out["trend_idx"] = (
         out["timestamp"] - out["timestamp"].min()
     ).dt.total_seconds() / (3600 * 24 * 365)
-    out["hour_x_temp"] = out["hour"] * out["temp_c"]
-    out["temp_c_roll_std_72"] = out["temp_c"].rolling(window=72, min_periods=24).std()
-    out["temp_change_vs_lag24"] = out["temp_c"] - out["temp_c"].shift(24)
+    out = timestamps.add_temp_derived_features(out, temp_col="temp_c", hour_col="hour")
     return out
 
 
@@ -67,15 +71,20 @@ def attach_holiday_names(train: pd.DataFrame, test: pd.DataFrame):
     Holiday calendar is built once from TRAIN's date range and applied to
     both splits — a fixed calendar lookup, not a fitted statistic, so this
     is safe to compute once rather than per-fold.
+
+    Only adds `holiday_name` — deliberately does NOT touch `is_holiday`,
+    which already exists on both frames from Preprocessing.ipynb, computed
+    over the FULL dataset's date range (pre-split). Re-deriving it here from
+    a train-only calendar range would silently flip it to 0 for any holiday
+    that falls in the test period, purely because the lookup window didn't
+    cover it.
     """
-    cal = USFederalHolidayCalendar()
     start = train["timestamp_central"].min().tz_localize(None)
     end = train["timestamp_central"].max().tz_localize(None)
-    holiday_names = cal.holidays(start=start, end=end, return_name=True)
+    holiday_names = timestamps.holiday_calendar_names(start, end)
 
-    for part in (train, test):
-        central_date = part["timestamp_central"].dt.normalize().dt.tz_localize(None)
-        part["holiday_name"] = central_date.map(holiday_names)
+    train = timestamps.apply_holiday_name(train, holiday_names)
+    test = timestamps.apply_holiday_name(test, holiday_names)
     return train, test
 
 
